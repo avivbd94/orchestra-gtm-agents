@@ -8,8 +8,9 @@ silent when clean.
 
 Invariants checked:
   I1  contact has an active lead        -> contacts.status = 'lead' (or customer)
-  I2  contact has a converted lead      -> contacts.status = 'customer'
-  I3  contacts.status = 'lead'          -> an active lead row exists
+  I2  contact has a Closed-Won deal     -> contacts.status = 'customer'
+  I2b contacts.status = 'customer'      -> a Closed-Won deal exists (0048)
+  I3  contacts.status = 'lead'          -> active lead OR open converted deal
   I4  leads.pool                        == pool_of_status(leads.status)
   I5  leads.lifecycle_stage             == lifecycle_of(leads.status)
   I6  'lead' tag                        <-> active lead exists
@@ -31,8 +32,13 @@ import core.db as db
 from core.vocab import PROSPECT_STATUSES
 
 _P = ",".join(f"'{s}'" for s in PROSPECT_STATUSES)
+# 0048: lifecycle is deal-aware — Customer only when the linked deal is Closed
+# Won; an open (or unresolvable) deal is 'Opportunity'; a lost deal drops out.
+# The I5 query must LEFT JOIN opportunities o2 on o2.id=l.converted_opportunity_id.
 _LIFE = """case
-    when l.converted_opportunity_id is not null or l.status = 'Converted' then 'Customer'
+    when o2.stage = 'Closed Won'                                          then 'Customer'
+    when o2.stage = 'Closed Lost'                                         then null
+    when l.converted_opportunity_id is not null or l.status = 'Converted' then 'Opportunity'
     when l.status = 'Meeting booked'                                      then 'Meeting'
     when l.status = 'Qualified'                                           then 'Qualified'
     when l.status in ('Replied','Waiting for a reply')                    then 'Engaged'
@@ -47,21 +53,31 @@ CHECKS: list[tuple[str, str]] = [
                       and lower(coalesce(l.status,'')) not in ('converted','unqualified'))
           and coalesce(c.archived,false)=false
           and c.status not in ('lead','customer')"""),
-    ("I2 converted lead but contact not customer",
+    ("I2 won deal but contact not customer",
      """select count(*) from contacts c
-        where exists (select 1 from leads l where l.contact_id=c.id
-                      and (l.converted_opportunity_id is not null or l.status='Converted'))
+        where (exists (select 1 from opportunities o where o.contact_id=c.id and o.stage='Closed Won')
+               or exists (select 1 from leads l join opportunities o on o.id=l.converted_opportunity_id
+                          where l.contact_id=c.id and o.stage='Closed Won'))
           and c.status is distinct from 'customer'"""),
-    ("I3 status=lead but no active lead row",
+    ("I2b customer without a won deal",
+     """select count(*) from contacts c
+        where c.status='customer'
+          and not exists (select 1 from opportunities o where o.contact_id=c.id and o.stage='Closed Won')
+          and not exists (select 1 from leads l join opportunities o on o.id=l.converted_opportunity_id
+                          where l.contact_id=c.id and o.stage='Closed Won')"""),
+    ("I3 status=lead but no pipeline (active lead or open deal)",
      """select count(*) from contacts c
         where c.status='lead'
           and not exists (select 1 from leads l where l.contact_id=c.id
-                          and lower(coalesce(l.status,'')) not in ('converted','unqualified'))"""),
+                          and lower(coalesce(l.status,'')) not in ('converted','unqualified'))
+          and not exists (select 1 from leads l join opportunities o on o.id=l.converted_opportunity_id
+                          where l.contact_id=c.id and o.stage not in ('Closed Won','Closed Lost'))"""),
     ("I4 pool drift",
      f"""select count(*) from leads
          where pool is distinct from (case when status in ({_P}) then 'prospect' else 'suspect' end)"""),
     ("I5 lifecycle drift",
      f"""select count(*) from leads l
+         left join opportunities o2 on o2.id = l.converted_opportunity_id
          where l.lifecycle_stage is distinct from ({_LIFE})"""),
     ("I6 'lead' tag drift",
      """select count(*) from contacts c
